@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -39,6 +40,15 @@ constexpr u32 SUPPORTED_CONTROLLER_STYLES =
 constexpr std::array<HidNpadIdType, PLAYER_COUNT> PLAYER_IDS = {
     HidNpadIdType_No1, HidNpadIdType_No2, HidNpadIdType_No3, HidNpadIdType_No4};
 constexpr u64 TOUCHSCREEN_PRESSED = 1ULL << 63;
+// The HID six-axis LIFO holds the 17 most recent samples.
+constexpr std::size_t SIX_AXIS_LIFO_SIZE = 17;
+// Samples queued beyond this mean emulation is polling slower than the sensor delivers them (for
+// example below full speed). The backlog is then merged into one sample so motion never lags.
+constexpr std::size_t MAX_MOTION_BACKLOG = 6;
+constexpr std::size_t MAX_PENDING_MOTION_SAMPLES = 32;
+// While Wii Remote updates are arriving, only they consume motion samples. Other polls (Serial
+// Interface, UI) just collect new samples so none are skipped between Wii Remote reports.
+constexpr std::chrono::milliseconds WIIMOTE_PACING_TIMEOUT{100};
 std::atomic<u64> s_touchscreen_state{};
 
 void UpdateTouchscreenState()
@@ -385,12 +395,12 @@ public:
     ClearMotionLocked();
   }
 
-  void Update()
+  void Update(bool wiimote_poll)
   {
     std::lock_guard lock{m_mutex};
     UpdatePadStateImpl(&m_pad);
     RefreshVibrationDeviceLocked();
-    UpdateMotionLocked();
+    UpdateMotionLocked(wiimote_poll);
   }
 
   bool IsConnected() const
@@ -721,18 +731,26 @@ private:
     }
   }
 
-  bool ReadMotionHandleLocked(int index, std::array<float, 3>* accel,
-                              std::array<float, 3>* gyro)
+  struct MotionSample
   {
-    HidSixAxisSensorState sensor{};
-    if (hidGetSixAxisSensorStates(m_motion_handles[index], &sensor, 1) != 1 ||
-        !(sensor.attributes & HidSixAxisSensorAttribute_IsConnected))
-    {
-      (void)hidStopSixAxisSensor(m_motion_handles[index]);
-      m_motion_ready[index] = false;
-      return false;
-    }
+    std::array<float, 3> accel{};
+    std::array<float, 3> gyro{};
+  };
 
+  // Joy-Cons deliver IMU samples in bursts (several per Bluetooth packet). Reading only the newest
+  // sample at each poll drops the samples in between, and with them the short acceleration peaks
+  // that Wii Remote swing detection relies on. Every new sample is queued instead and handed out
+  // one per Wii Remote update, which runs at the same 200 Hz as the sensor.
+  struct MotionStream
+  {
+    int handle_index = -1;
+    u64 last_sampling_number = 0;
+    std::deque<MotionSample> pending;
+    MotionSample current{};
+  };
+
+  static bool ConvertMotionSample(const HidSixAxisSensorState& sensor, MotionSample* sample)
+  {
     const HidVector& sensor_accel = sensor.acceleration;
     const HidVector& sensor_gyro = sensor.angular_velocity;
     if (!std::isfinite(sensor_accel.x) || !std::isfinite(sensor_accel.y) ||
@@ -744,29 +762,138 @@ private:
 
     constexpr float gravity = static_cast<float>(MathUtil::GRAVITY_ACCELERATION);
     constexpr float tau = static_cast<float>(MathUtil::TAU);
-    *accel = {sensor_accel.x * gravity, sensor_accel.y * gravity,
-              sensor_accel.z * gravity};
-    if (gyro)
-      *gyro = {sensor_gyro.x * tau, sensor_gyro.y * tau, sensor_gyro.z * tau};
+    sample->accel = {sensor_accel.x * gravity, sensor_accel.y * gravity,
+                     sensor_accel.z * gravity};
+    sample->gyro = {sensor_gyro.x * tau, sensor_gyro.y * tau, sensor_gyro.z * tau};
     return true;
+  }
+
+  // Collapses a backlog into one sample: the angular velocities are averaged so the rotation the
+  // game integrates stays correct, and the acceleration that strays furthest from 1 g is kept so a
+  // swing is still seen.
+  static MotionSample MergeMotionSamples(const std::deque<MotionSample>& samples)
+  {
+    constexpr float gravity = static_cast<float>(MathUtil::GRAVITY_ACCELERATION);
+    MotionSample merged{};
+    float strongest = -1.0f;
+    for (const MotionSample& sample : samples)
+    {
+      for (std::size_t axis = 0; axis < 3; ++axis)
+        merged.gyro[axis] += sample.gyro[axis];
+
+      const float magnitude =
+          std::sqrt(sample.accel[0] * sample.accel[0] + sample.accel[1] * sample.accel[1] +
+                    sample.accel[2] * sample.accel[2]);
+      const float deviation = std::abs(magnitude - gravity);
+      if (deviation > strongest)
+      {
+        strongest = deviation;
+        merged.accel = sample.accel;
+      }
+    }
+    for (float& value : merged.gyro)
+      value /= static_cast<float>(samples.size());
+    return merged;
+  }
+
+  bool ReadMotionHandleLocked(int index, MotionStream* stream)
+  {
+    std::array<HidSixAxisSensorState, SIX_AXIS_LIFO_SIZE> states{};
+    // States are returned newest first with consecutive sampling numbers.
+    const std::size_t total =
+        hidGetSixAxisSensorStates(m_motion_handles[index], states.data(), states.size());
+    if (total == 0 || !(states[0].attributes & HidSixAxisSensorAttribute_IsConnected))
+    {
+      (void)hidStopSixAxisSensor(m_motion_handles[index]);
+      m_motion_ready[index] = false;
+      return false;
+    }
+
+    const u64 newest = states[0].sampling_number;
+    if (stream->handle_index != index || newest < stream->last_sampling_number)
+    {
+      // New or restarted sensor: start from its newest sample rather than replaying old ones.
+      stream->handle_index = index;
+      stream->pending.clear();
+      stream->last_sampling_number = newest - 1;
+    }
+
+    for (std::size_t i = total; i-- > 0;)
+    {
+      if (states[i].sampling_number <= stream->last_sampling_number)
+        continue;
+      MotionSample sample;
+      if (ConvertMotionSample(states[i], &sample))
+        stream->pending.push_back(sample);
+    }
+    stream->last_sampling_number = newest;
+
+    while (stream->pending.size() > MAX_PENDING_MOTION_SAMPLES)
+      stream->pending.pop_front();
+    return true;
+  }
+
+  static void AdvanceMotionStream(MotionStream* stream, bool paced)
+  {
+    if (stream->pending.empty())
+      return;
+
+    if (!paced)
+    {
+      // Nothing consumes samples at a fixed rate (GameCube games, menus): use the newest one.
+      stream->current = stream->pending.back();
+      stream->pending.clear();
+    }
+    else if (stream->pending.size() > MAX_MOTION_BACKLOG)
+    {
+      stream->current = MergeMotionSamples(stream->pending);
+      stream->pending.clear();
+    }
+    else
+    {
+      stream->current = stream->pending.front();
+      stream->pending.pop_front();
+    }
+  }
+
+  static void ResetMotionStream(MotionStream* stream, const MotionSample& rest)
+  {
+    stream->handle_index = -1;
+    stream->pending.clear();
+    stream->current = rest;
+  }
+
+  void PublishMotionLocked()
+  {
+    m_accel = m_primary_motion.current.accel;
+    m_gyro = m_primary_motion.current.gyro;
+    m_nunchuk_accel = m_nunchuk_motion.current.accel;
   }
 
   void ClearNunchukMotionLocked()
   {
-    m_nunchuk_accel = {0.0f, 0.0f,
-                       -static_cast<float>(MathUtil::GRAVITY_ACCELERATION)};
+    ResetMotionStream(&m_nunchuk_motion,
+                      {{0.0f, 0.0f, -static_cast<float>(MathUtil::GRAVITY_ACCELERATION)}, {}});
+    m_nunchuk_accel = m_nunchuk_motion.current.accel;
   }
 
   void ClearMotionLocked()
   {
+    ResetMotionStream(&m_primary_motion, {});
     m_accel = {};
     m_gyro = {};
     ClearNunchukMotionLocked();
   }
 
-  void UpdateMotionLocked()
+  void UpdateMotionLocked(bool wiimote_poll)
   {
     const auto now = Clock::now();
+    if (wiimote_poll)
+      m_last_wiimote_poll = now;
+    const bool paced = now - m_last_wiimote_poll < WIIMOTE_PACING_TIMEOUT;
+    // Between Wii Remote updates other polls only collect samples.
+    const bool consume = wiimote_poll || !paced;
+
     int active = GetActiveMotionHandleLocked();
     int nunchuk = GetNunchukMotionHandleLocked();
     if ((active < 0 || NeedsMotionProbeLocked()) && now >= m_next_motion_probe)
@@ -784,15 +911,25 @@ private:
       return;
     }
 
-    if (!ReadMotionHandleLocked(active, &m_accel, &m_gyro))
+    if (!ReadMotionHandleLocked(active, &m_primary_motion))
     {
       m_next_motion_probe = now + DEVICE_RETRY_INTERVAL;
       ClearMotionLocked();
       return;
     }
 
-    if (nunchuk < 0 || !ReadMotionHandleLocked(nunchuk, &m_nunchuk_accel, nullptr))
+    if (nunchuk < 0 || !ReadMotionHandleLocked(nunchuk, &m_nunchuk_motion))
+    {
       ClearNunchukMotionLocked();
+    }
+    else if (consume)
+    {
+      AdvanceMotionStream(&m_nunchuk_motion, paced);
+    }
+
+    if (consume)
+      AdvanceMotionStream(&m_primary_motion, paced);
+    PublishMotionLocked();
   }
 
   mutable std::mutex m_mutex;
@@ -816,6 +953,10 @@ private:
   std::array<float, 3> m_gyro{};
   std::array<float, 3> m_nunchuk_accel{
       0.0f, 0.0f, -static_cast<float>(MathUtil::GRAVITY_ACCELERATION)};
+  MotionStream m_primary_motion{};
+  MotionStream m_nunchuk_motion{
+      .current = {{0.0f, 0.0f, -static_cast<float>(MathUtil::GRAVITY_ACCELERATION)}, {}}};
+  Clock::time_point m_last_wiimote_poll{};
 };
 
 class Button final : public Core::Device::Input
@@ -1043,8 +1184,10 @@ public:
       return;
     m_joycon_assignments.Update();
     UpdateTouchscreenState();
+    const bool wiimote_poll =
+        ControllerInterface::GetCurrentInputChannel() == ciface::InputChannel::Bluetooth;
     for (ControllerState& controller : m_controllers)
-      controller.Update();
+      controller.Update(wiimote_poll);
   }
 
 private:
