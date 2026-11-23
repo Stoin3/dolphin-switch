@@ -67,6 +67,13 @@ PREPARED="${WORK}/prepared"
 mkdir -p "${PREPARED}"
 cp -a "${SDK_SOURCE}/." "${PREPARED}/"
 
+# Some SDK builds ship archives whose symbol index omits the bundled Rust core
+# objects, so the linker cannot resolve NAK's core:: references. Rebuild every
+# index before merging.
+for archive in "${PREPARED}"/lib/*.a; do
+  "${AR}" s "${archive}"
+done
+
 # Dolphin's Vulkan loader stores entry points in global PFN variables named
 # like Vulkan functions. Resolve Mesa into one object and localize only the
 # public vk* entry points which collide with those variables. Mesa's internal
